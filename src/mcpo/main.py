@@ -20,6 +20,13 @@ from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamablehttp_client
 
 from mcpo.utils.auth import APIKeyMiddleware, get_verify_api_key
+from mcpo.utils.bridge import attach_protocol_bridges, bridge_runtime_context
+from mcpo.utils.managed import (
+    InstallManager,
+    RuntimeManager,
+    normalize_managed_server_spec,
+    validate_server_config_extensions,
+)
 from mcpo.utils.main import (
     get_model_fields,
     get_tool_handler,
@@ -188,9 +195,14 @@ class MCPConnectionManager:
 
 def validate_server_config(server_name: str, server_cfg: Dict[str, Any]) -> None:
     """Validate individual server configuration."""
+    validate_server_config_extensions(server_name, server_cfg)
     server_type = server_cfg.get("type")
+    upstream_cfg = server_cfg.get("upstream")
 
-    if normalize_server_type(server_type) in ("sse", "streamable-http"):
+    if upstream_cfg:
+        # New managed format. Validation is performed in validate_server_config_extensions.
+        pass
+    elif normalize_server_type(server_type) in ("sse", "streamable-http"):
         if not server_cfg.get("url"):
             raise ValueError(
                 f"Server '{server_name}' of type '{server_type}' requires a 'url' field"
@@ -204,9 +216,9 @@ def validate_server_config(server_name: str, server_cfg: Dict[str, Any]) -> None
     elif server_cfg.get("url") and not server_type:
         # Fallback for old SSE config without explicit type
         pass
-    else:
+    elif not server_cfg.get("runtime"):
         raise ValueError(f"Server '{server_name}' must have either 'command' for stdio or 'type' and 'url' for remote servers")
-    
+
     # Validate disabledTools (supports camelCase & snake_case for backwards compatibility)
     disabled_tools = server_cfg.get("disabledTools")
     if disabled_tools is None:
@@ -262,6 +274,7 @@ def create_sub_app(
     lifespan,
 ) -> FastAPI:
     """Create a sub-application for an MCP server."""
+    managed_spec = normalize_managed_server_spec(server_name, server_cfg)
     sub_app = FastAPI(
         title=f"{server_name}",
         description=f"{server_name} MCP Server\n\n- [back to tool list](/docs)",
@@ -277,32 +290,13 @@ def create_sub_app(
         allow_headers=["*"],
     )
 
-    # Configure server type and connection parameters
-    if server_cfg.get("command"):
-        # stdio
-        sub_app.state.server_type = "stdio"
-        sub_app.state.command = server_cfg["command"]
-        sub_app.state.args = server_cfg.get("args", [])
-        sub_app.state.env = {**os.environ, **server_cfg.get("env", {})}
-
-    server_config_type = server_cfg.get("type")
-    if server_config_type == "sse" and server_cfg.get("url"):
-        sub_app.state.server_type = "sse"
-        sub_app.state.args = [server_cfg["url"]]
-        sub_app.state.headers = server_cfg.get("headers")
-    elif normalize_server_type(
-        server_config_type
-    ) == "streamable-http" and server_cfg.get("url"):
-        url = server_cfg["url"]
-        sub_app.state.server_type = "streamablehttp"
-        sub_app.state.args = [url]
-        sub_app.state.headers = server_cfg.get("headers")
-    elif not server_config_type and server_cfg.get(
-        "url"
-    ):  # Fallback for old SSE config
-        sub_app.state.server_type = "sse"
-        sub_app.state.args = [server_cfg["url"]]
-        sub_app.state.headers = server_cfg.get("headers")
+    # Configure server type and connection parameters from normalized spec.
+    sub_app.state.managed_spec = managed_spec
+    sub_app.state.server_type = managed_spec.upstream.server_type
+    sub_app.state.command = managed_spec.upstream.command
+    sub_app.state.args = managed_spec.upstream.args
+    sub_app.state.env = {**os.environ, **(managed_spec.upstream.env or {})}
+    sub_app.state.headers = managed_spec.upstream.headers
 
     if api_key and strict_auth:
         sub_app.add_middleware(APIKeyMiddleware, api_key=api_key)
@@ -311,19 +305,16 @@ def create_sub_app(
     sub_app.state.connection_timeout = connection_timeout
 
     # Store list of tools to be disabled, if present (accept both key styles)
-    disabled_tools = server_cfg.get("disabledTools")
-    if disabled_tools is None:
-        disabled_tools = server_cfg.get("disabled_tools", [])
-    sub_app.state.disabled_tools = disabled_tools
+    sub_app.state.disabled_tools = managed_spec.disabled_tools
 
     
     # Store client header forwarding configuration
-    sub_app.state.client_header_forwarding = server_cfg.get(
-        "client_header_forwarding", {"enabled": False}
-    )
+    sub_app.state.client_header_forwarding = managed_spec.client_header_forwarding
 
     # Store OAuth configuration if present
-    sub_app.state.oauth_config = server_cfg.get("oauth")
+    sub_app.state.oauth_config = managed_spec.oauth_config
+    sub_app.state.serve_protocols = managed_spec.serve_protocols
+    attach_protocol_bridges(sub_app, server_name=server_name, serve_protocols=managed_spec.serve_protocols)
 
 
     return sub_app
@@ -676,7 +667,25 @@ async def lifespan(app: FastAPI):
     else:
         # This is a sub-app's lifespan
         app.state.is_connected = False
+        managed_spec = getattr(app.state, "managed_spec", None)
+        runtime_manager = None
+        bridge_context = bridge_runtime_context(app)
         try:
+            if managed_spec:
+                install_manager = InstallManager(managed_spec)
+                install_manager.prepare()
+
+                runtime_manager = RuntimeManager(managed_spec)
+                runtime_manager.start_background_runtime_if_needed()
+                resolved_upstream = runtime_manager.resolve_upstream()
+                server_type = resolved_upstream.server_type
+                command = resolved_upstream.command
+                args = resolved_upstream.args
+                env = resolved_upstream.env
+                app.state.headers = resolved_upstream.headers
+                if resolved_upstream.url:
+                    args = [resolved_upstream.url]
+
             # Check for OAuth configuration
             oauth_config = getattr(app.state, "oauth_config", None)
             auth_provider = None
@@ -716,6 +725,7 @@ async def lifespan(app: FastAPI):
 
             session = await session_manager.get_session()
             app.state.session = session
+            await bridge_context.__aenter__()
             await create_dynamic_endpoints(app, api_dependency=api_dependency)
             app.state.is_connected = True
             yield
@@ -729,11 +739,15 @@ async def lifespan(app: FastAPI):
             # Re-raise the exception so it propagates to the main app's lifespan
             raise
         finally:
+            with contextlib.suppress(Exception):
+                await bridge_context.__aexit__(None, None, None)
             session_manager = getattr(app.state, "session_manager", None)
             if session_manager:
                 await session_manager.close()
                 app.state.session_manager = None
             app.state.session = None
+            if runtime_manager:
+                runtime_manager.stop()
 
 
 async def run(
